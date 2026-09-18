@@ -525,11 +525,15 @@ export default function HospitalRecordsPage() {
   );
 }
 
-function formatDate(date: string) {
+function formatDate(date: string | null) {
+  if (!date) {
+    return "Not specified";
+  }
+
   const parsed = new Date(date);
 
   if (Number.isNaN(parsed.getTime())) {
-    return date;
+    return "Not specified";
   }
 
   return parsed.toLocaleDateString("en-IN", {

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { supabase } from "@/src/lib/supabase";
 
@@ -221,7 +221,7 @@ function formatDate(
    PAGE
 ========================================================= */
 
-export default function ProfilePage() {
+function ProfileContent() {
   const searchParams =
     useSearchParams();
 
@@ -1769,5 +1769,28 @@ function InfoBox({
       </p>
 
     </div>
+  );
+}
+
+/* =========================================================
+   SUSPENSE WRAPPER
+   Next.js requires useSearchParams() to be contained inside
+   a Suspense boundary during production builds.
+========================================================= */
+
+export default function ProfilePage() {
+  return (
+    <Suspense
+      fallback={
+        <main className="min-h-screen bg-[#F7FAF8] p-6">
+          <div className="mx-auto max-w-5xl">
+            <div className="h-10 w-56 animate-pulse rounded-xl bg-[#E4EEEB]" />
+            <div className="mt-8 h-[520px] animate-pulse rounded-[28px] bg-[#E4EEEB]" />
+          </div>
+        </main>
+      }
+    >
+      <ProfileContent />
+    </Suspense>
   );
 }
