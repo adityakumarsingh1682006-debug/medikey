@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+:root {
+  /* MediKey Brand */
+  --medikey-teal: #176b67;
+  --medikey-sage: #7bae9d;
+  --medikey-ivory: #f7faf8;
+  --medikey-mint: #e6f3ef;
+
+  /* Text */
+  --medikey-text: #19302f;
+  --medikey-muted: #667a78;
+
+  /* Status */
+  --medikey-danger: #c93c4b;
+  --medikey-warning: #c98a28;
+
+  /* UI */
+  --medikey-white: #ffffff;
+  --medikey-border: #dfe9e6;
+}
+
+@theme inline {
+  --color-background: var(--medikey-ivory);
+  --color-foreground: var(--medikey-text);
+
+  --color-medikey-teal: var(--medikey-teal);
+  --color-medikey-sage: var(--medikey-sage);
+  --color-medikey-mint: var(--medikey-mint);
+
+  --color-medikey-danger: var(--medikey-danger);
+  --color-medikey-warning: var(--medikey-warning);
+
+  --color-medikey-muted: var(--medikey-muted);
+  --color-medikey-border: var(--medikey-border);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: var(--medikey-ivory);
+  color: var(--medikey-text);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+button,
+a,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
