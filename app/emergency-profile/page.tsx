@@ -251,10 +251,17 @@ function EmergencyProfileContent() {
         return;
       }
 
+      // A fresh account may open this page before the dashboard has created
+      // its family/member rows. Initialize them here instead of showing a
+      // blank/error page.
+      let familyId: string | null = null;
+      let loadedMembers: Member[] = [];
+
       const { data: family, error: familyError } = await supabase
         .from("families")
         .select("id")
         .eq("owner_id", user.id)
+        .order("created_at", { ascending: true })
         .limit(1)
         .maybeSingle();
 
@@ -262,38 +269,92 @@ function EmergencyProfileContent() {
         throw familyError;
       }
 
-      if (!family) {
-        setMembers([]);
-        setMember(null);
-        setProfile(null);
-        setSavedProfile(null);
-        return;
+      familyId = family?.id ?? null;
+
+      if (familyId) {
+        const { data: memberData, error: memberError } = await supabase
+          .from("family_members")
+          .select(
+            "id, full_name, relationship, date_of_birth, photo_url"
+          )
+          .eq("family_id", familyId)
+          .order("created_at", { ascending: true });
+
+        if (memberError) {
+          throw memberError;
+        }
+
+        loadedMembers = (memberData || []) as Member[];
       }
 
-      const { data: memberData, error: memberError } = await supabase
-        .from("family_members")
-        .select(
-          "id, full_name, relationship, date_of_birth, photo_url"
-        )
-        .eq("family_id", family.id)
-        .order("created_at", {
-          ascending: true,
-        });
+      // If this is a brand-new account (or initialization was incomplete),
+      // create the family and Self member safely.
+      if (loadedMembers.length === 0) {
+        const fullName =
+          (user.user_metadata?.full_name as string | undefined)?.trim() ||
+          user.email?.split("@")[0] ||
+          "Medi Key User";
 
-      if (memberError) {
-        throw memberError;
+        if (!familyId) {
+          const { data: createdFamily, error: createFamilyError } =
+            await supabase
+              .from("families")
+              .insert({
+                name: `${fullName}'s Family`,
+                owner_id: user.id,
+              })
+              .select("id")
+              .single();
+
+          if (createFamilyError) {
+            throw createFamilyError;
+          }
+
+          familyId = createdFamily.id;
+        }
+
+        // Prefer an existing Self/member row before inserting another one.
+        const { data: existingMember, error: existingMemberError } =
+          await supabase
+            .from("family_members")
+            .select(
+              "id, full_name, relationship, date_of_birth, photo_url"
+            )
+            .eq("family_id", familyId)
+            .eq("user_id", user.id)
+            .limit(1)
+            .maybeSingle();
+
+        if (existingMemberError) {
+          throw existingMemberError;
+        }
+
+        if (existingMember) {
+          loadedMembers = [existingMember as Member];
+        } else {
+          const { data: createdMember, error: createMemberError } =
+            await supabase
+              .from("family_members")
+              .insert({
+                family_id: familyId,
+                user_id: user.id,
+                full_name: fullName,
+                relationship: "Self",
+              })
+              .select(
+                "id, full_name, relationship, date_of_birth, photo_url"
+              )
+              .single();
+
+          if (createMemberError) {
+            throw createMemberError;
+          }
+
+          loadedMembers = [createdMember as Member];
+        }
       }
-
-      const loadedMembers = (memberData || []) as Member[];
 
       setMembers(loadedMembers);
-
-      if (loadedMembers.length === 0) {
-        setMember(null);
-        setProfile(null);
-        setSavedProfile(null);
-        return;
-      }
 
       let selected = loadedMembers[0];
 
@@ -308,7 +369,7 @@ function EmergencyProfileContent() {
       } else {
         const self = loadedMembers.find(
           (item) =>
-            item.relationship?.toLowerCase() === "self"
+            item.relationship?.trim().toLowerCase() === "self"
         );
 
         if (self) {
@@ -318,13 +379,28 @@ function EmergencyProfileContent() {
 
       setMember(selected);
 
+      // A missing emergency_profiles row is normal for a new user.
+      // loadEmergencyProfile() converts it into an empty editable form.
       await loadEmergencyProfile(selected.id);
     } catch (err) {
-      console.error(err);
+      console.error("Emergency profile load error:", err);
 
-      setError(
-        "We couldn't load this emergency profile. Please try again."
-      );
+      const technicalMessage =
+        err instanceof Error ? err.message : String(err);
+
+      if (
+        technicalMessage.toLowerCase().includes("row-level security") ||
+        technicalMessage.toLowerCase().includes("permission") ||
+        technicalMessage.toLowerCase().includes("policy")
+      ) {
+        setError(
+          "Medi Key couldn't access your family profile. Please sign out and sign in again."
+        );
+      } else {
+        setError(
+          "We couldn't load this emergency profile. Please refresh and try again."
+        );
+      }
     } finally {
       setLoading(false);
     }
@@ -354,7 +430,17 @@ function EmergencyProfileContent() {
     }
 
     const nextProfile = data
-      ? (data as EmergencyProfile)
+      ? {
+          ...emptyProfile(memberId),
+          ...data,
+          blood_group: data.blood_group ?? "",
+          allergies: data.allergies ?? "",
+          critical_medications: data.critical_medications ?? "",
+          medical_conditions: data.medical_conditions ?? "",
+          emergency_notes: data.emergency_notes ?? "",
+          emergency_contact_name: data.emergency_contact_name ?? "",
+          emergency_contact_phone: data.emergency_contact_phone ?? "",
+        }
       : emptyProfile(memberId);
 
     setProfile(nextProfile);
@@ -689,20 +775,30 @@ function EmergencyProfileContent() {
 
         {/* ALERTS */}
         {error && (
-          <div className="mb-5 flex items-start gap-3 rounded-2xl border border-[#F0C9CD] bg-[#FFF5F6] p-4 text-sm text-[#9D2D39]">
-            <div className="mt-0.5 shrink-0">
-              <Icon name="warning" size={18} />
+          <div className="mb-5 flex flex-col gap-3 rounded-2xl border border-[#F0C9CD] bg-[#FFF5F6] p-4 text-sm text-[#9D2D39] sm:flex-row sm:items-start sm:justify-between">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 shrink-0">
+                <Icon name="warning" size={18} />
+              </div>
+
+              <div>
+                <p className="font-black">
+                  Something needs attention
+                </p>
+
+                <p className="mt-0.5 leading-5">
+                  {error}
+                </p>
+              </div>
             </div>
 
-            <div>
-              <p className="font-black">
-                Something needs attention
-              </p>
-
-              <p className="mt-0.5 leading-5">
-                {error}
-              </p>
-            </div>
+            <button
+              type="button"
+              onClick={loadPage}
+              className="w-fit rounded-xl border border-[#E8B9BE] bg-white px-3.5 py-2 text-xs font-black text-[#9D2D39] transition hover:bg-[#FFF0F1]"
+            >
+              Try again
+            </button>
           </div>
         )}
 
@@ -1169,7 +1265,7 @@ function SelectField({
 
       <div className="relative">
         <select
-          value={value}
+          value={value ?? ""}
           onChange={(event) =>
             onChange(event.target.value)
           }
