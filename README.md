@@ -1,36 +1,56 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Medi Key
 
-## Getting Started
+### When you can't speak, Medi Key speaks for you.
 
-First, run the development server:
+Medi Key is an emergency health identity platform designed to make critical medical information available when a person cannot communicate.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+A physical card with a unique QR code allows anyone with a smartphone to quickly access essential emergency information — without installing an app.
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+---
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## 🚨 The Problem
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+During an emergency, a person may be unconscious, confused, alone, or unable to communicate their medical history.
 
-## Learn More
+Important information such as:
 
-To learn more about Next.js, take a look at the following resources:
+- Blood group
+- Serious allergies
+- Critical medications
+- Medical conditions
+- Emergency contacts
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+may not be immediately available when it is needed most.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Family members may not be nearby, and searching for medical history can take valuable time.
 
-## Deploy on Vercel
+**Medi Key is built to bridge that information gap.**
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+---
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## 💡 The Solution
+
+Medi Key combines a physical medical identity card with a secure digital profile.
+
+### Carry → Scan → Know
+
+```text
+        👤 PERSON
+            │
+            ▼
+      💳 MEDI KEY CARD
+            │
+            ▼
+        📱 SCAN QR
+            │
+            ▼
+   🚨 EMERGENCY PROFILE
+            │
+      ┌─────┴─────┐
+      ▼           ▼
+ Critical Info   Emergency
+                 Contact
+            │
+            ▼
+     🏥 AUTHORIZED
+     MEDICAL ACCESS
