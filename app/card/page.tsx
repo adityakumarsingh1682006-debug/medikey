@@ -110,6 +110,16 @@ function formatDOB(dob: string | null | undefined): string {
   });
 }
 
+function generatePermanentToken(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID().replace(/-/g, "");
+  }
+
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function getQrDestinationUrl(token: string): string {
   if (typeof window === "undefined") return `/emergency/${token}`;
   return `${window.location.origin}/emergency/${token}`;
@@ -1037,7 +1047,7 @@ export default function MedikeyCardPage() {
           .maybeSingle(),
         supabase
           .from("medikey_cards")
-          .select("id, qr_token, is_active")
+          .select("id, member_id, qr_token, is_active")
           .eq("member_id", memberId)
           .maybeSingle(),
       ]);
@@ -1046,9 +1056,46 @@ export default function MedikeyCardPage() {
       if (cardRes.error) throw cardRes.error;
 
       setEmergencyProfile((profileRes.data as EmergencyProfile) || null);
-      setMedikeyCard((cardRes.data as MedikeyCard) || null);
+
+      // Every family member must have one permanent MediKey card.
+      // Older/newly-created members may not have a row yet, so create it
+      // automatically the first time their card page is opened.
+      if (cardRes.data) {
+        setMedikeyCard(cardRes.data as MedikeyCard);
+        return;
+      }
+
+      const qrToken = generatePermanentToken();
+
+      const { data: createdCard, error: createCardError } = await supabase
+        .from("medikey_cards")
+        .insert({
+          member_id: memberId,
+          qr_token: qrToken,
+          is_active: true,
+        })
+        .select("id, member_id, qr_token, is_active")
+        .single();
+
+      if (createCardError) {
+        // If another tab/request created the card at the same time, simply
+        // load that existing card instead of showing a false failure.
+        const { data: retryCard, error: retryError } = await supabase
+          .from("medikey_cards")
+          .select("id, member_id, qr_token, is_active")
+          .eq("member_id", memberId)
+          .maybeSingle();
+
+        if (retryError || !retryCard) throw createCardError;
+
+        setMedikeyCard(retryCard as MedikeyCard);
+        return;
+      }
+
+      setMedikeyCard(createdCard as MedikeyCard);
     } catch (e: any) {
-      setError(e?.message || "Failed to load card data for this member.");
+      console.error("MediKey card generation error:", e);
+      setError(e?.message || "Failed to load or generate the MediKey card.");
     }
   }, []);
 
@@ -1366,9 +1413,14 @@ export default function MedikeyCardPage() {
           </div>
         )}
 
-        {!selectedMember || !medikeyCard ? (
+        {!selectedMember ? (
           <div className="rounded-xl border border-[#C9DEDA] bg-white p-8 text-center text-sm text-[#3F6461]">
-            No card has been generated for this member yet.
+            No family member found. Add a member to create a MediKey card.
+          </div>
+        ) : !medikeyCard ? (
+          <div className="rounded-xl border border-[#C9DEDA] bg-white p-8 text-center text-sm text-[#3F6461]">
+            <div className="mx-auto h-8 w-8 animate-spin rounded-full border-2 border-[#C9DEDA] border-t-[#176B67]" />
+            <p className="mt-3">Generating your permanent MediKey card…</p>
           </div>
         ) : (
           <>
