@@ -579,8 +579,10 @@ function CardFront({ member, profile, card, photoSrc }: CardFaceProps) {
 }
 
 function CardBack({ member, profile, card }: CardFaceProps) {
-  const hasPhone = !!profile?.emergency_contact_phone;
-  const hasContactName = !!profile?.emergency_contact_name;
+  const emergencyPhone = String(profile?.emergency_contact_phone ?? "").trim();
+  const emergencyContactName = String(profile?.emergency_contact_name ?? "").trim();
+  const hasPhone = emergencyPhone.length > 0;
+  const hasContactName = emergencyContactName.length > 0;
 
   return (
     <div
@@ -685,17 +687,21 @@ function CardBack({ member, profile, card }: CardFaceProps) {
                       boxShadow: "0 4px 12px rgba(0,0,0,0.18)",
                     }}
                   >
-                    <Phone size={28} color={COLORS.darkTeal} />
-                    <span
+                    <Phone size={28} color={COLORS.darkTeal} style={{ flexShrink: 0 }} />
+                    <div
                       style={{
-                        fontSize: 36,
-                        fontWeight: 900,
-                        letterSpacing: "0.4px",
+                        fontFamily: "Arial, Helvetica, sans-serif",
+                        fontSize: 34,
+                        fontWeight: 800,
+                        lineHeight: 1.1,
+                        letterSpacing: "0.2px",
                         color: COLORS.darkTeal,
+                        whiteSpace: "nowrap",
+                        display: "block",
                       }}
                     >
-                      {profile?.emergency_contact_phone}
-                    </span>
+                      {emergencyPhone}
+                    </div>
                   </div>
                 )}
                 {hasContactName && (
@@ -707,7 +713,7 @@ function CardBack({ member, profile, card }: CardFaceProps) {
                       marginTop: hasPhone ? 14 : 0,
                     }}
                   >
-                    {profile?.emergency_contact_name}
+                    {emergencyContactName}
                   </div>
                 )}
               </div>
