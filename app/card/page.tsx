@@ -1204,6 +1204,19 @@ export default function MedikeyCardPage() {
         "FAST"
       );
 
+      // Final PDF-only safety layer: place the emergency phone directly into
+      // the PDF after the raster image. This guarantees the number is visible
+      // even if the browser canvas renderer omits the phone text.
+      const emergencyPhone = String(
+        fresh.profile?.emergency_contact_phone ?? ""
+      ).trim();
+      if (emergencyPhone) {
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(8.5);
+        pdf.setTextColor(8, 62, 59);
+        pdf.text(emergencyPhone, 16.5, 19.6);
+      }
+
       pdf.save(`MediKey-${fresh.member.full_name.replace(/\s+/g, "_")}.pdf`);
     } catch (e: any) {
       console.error(e);
