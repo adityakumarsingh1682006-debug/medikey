@@ -149,6 +149,68 @@ function waitForNextPaint(): Promise<void> {
   });
 }
 
+/**
+ * html2canvas can occasionally omit a text node inside a flex/inline-flex
+ * element even though the same text is visible in the browser. The phone
+ * number is critical card data, so we paint it directly onto the export
+ * canvas as a final safety layer. The position is calculated from the actual
+ * rendered phone box, so it stays aligned with the existing card design.
+ */
+function drawEmergencyPhoneOnCanvas(
+  canvas: HTMLCanvasElement,
+  root: HTMLElement,
+  phone: string
+): void {
+  const value = String(phone || "").trim();
+  if (!value) return;
+
+  const box = root.querySelector<HTMLElement>("[data-medikey-phone-box]");
+  if (!box) return;
+
+  const rootRect = root.getBoundingClientRect();
+  const boxRect = box.getBoundingClientRect();
+  if (!rootRect.width || !rootRect.height) return;
+
+  const scaleX = canvas.width / rootRect.width;
+  const scaleY = canvas.height / rootRect.height;
+
+  const boxLeft = (boxRect.left - rootRect.left) * scaleX;
+  const boxTop = (boxRect.top - rootRect.top) * scaleY;
+  const boxWidth = boxRect.width * scaleX;
+  const boxHeight = boxRect.height * scaleY;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  // Match the existing visual size while shrinking slightly for unusually
+  // long phone numbers.
+  const baseFontSize = 34 * Math.min(scaleX, scaleY);
+  const fontSize =
+    value.length > 18 ? baseFontSize * 0.76 : value.length > 15 ? baseFontSize * 0.86 : baseFontSize;
+
+  ctx.save();
+  ctx.font = `800 ${fontSize}px Arial, Helvetica, sans-serif`;
+  ctx.fillStyle = COLORS.darkTeal;
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "left";
+
+  // The existing phone icon occupies the left side of the white box.
+  const leftPadding = 22 * scaleX;
+  const iconAndGap = 28 * scaleX + 12 * scaleX;
+  const textX = boxLeft + leftPadding + iconAndGap;
+  const maxWidth = boxWidth - leftPadding * 2 - iconAndGap;
+  let output = value;
+
+  if (ctx.measureText(output).width > maxWidth) {
+    while (output.length > 1 && ctx.measureText(output).width > maxWidth) {
+      output = output.slice(0, -1);
+    }
+  }
+
+  ctx.fillText(output, textX, boxTop + boxHeight / 2);
+  ctx.restore();
+}
+
 /* ============================================================================
    LOGO / ICONOGRAPHY
    ========================================================================= */
@@ -677,6 +739,7 @@ function CardBack({ member, profile, card }: CardFaceProps) {
               >
                 {hasPhone && (
                   <div
+                    data-medikey-phone-box
                     style={{
                       display: "inline-flex",
                       alignItems: "center",
@@ -1106,6 +1169,13 @@ export default function MedikeyCardPage() {
         backgroundColor: COLORS.darkTeal,
       });
 
+      // Guarantee that the emergency contact phone is present in the raster export.
+      drawEmergencyPhoneOnCanvas(
+        backCanvas,
+        backExportRef.current,
+        fresh.profile?.emergency_contact_phone ?? ""
+      );
+
       const pdf = new jsPDF({
         orientation: "landscape",
         unit: "mm",
@@ -1161,6 +1231,14 @@ export default function MedikeyCardPage() {
         useCORS: true,
         backgroundColor: side === "front" ? "#ffffff" : COLORS.darkTeal,
       });
+
+      if (side === "back") {
+        drawEmergencyPhoneOnCanvas(
+          canvas,
+          ref.current,
+          fresh.profile?.emergency_contact_phone ?? ""
+        );
+      }
 
       const link = document.createElement("a");
       link.download = `MediKey-${fresh.member.full_name.replace(/\s+/g, "_")}-${side}.png`;
