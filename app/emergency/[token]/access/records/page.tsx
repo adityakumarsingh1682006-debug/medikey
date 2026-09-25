@@ -9,6 +9,14 @@ type Patient = {
   full_name: string | null;
 };
 
+type EmergencyProfile = {
+  blood_group: string | null;
+  allergies: string | null;
+  critical_medications: string | null;
+  medical_conditions: string | null;
+  emergency_notes: string | null;
+};
+
 type RecordItem = {
   id: string;
   title: string;
@@ -30,6 +38,22 @@ type InsurancePolicy = {
   customer_care_phone: string | null;
 };
 
+const AI_CACHE_TTL_MS = 15 * 60 * 1000;
+const AI_CACHE_PREFIX = "medikey-ai-summary:";
+
+type AISummary = {
+  headline: string;
+  summary: string;
+  criticalAlerts: string[];
+  medications: string[];
+  conditions: string[];
+  documentFindings?: string[];
+  documentsProcessed?: number;
+  documentsSkipped?: string[];
+  verificationNote: string;
+  isFallback?: boolean;
+};
+
 export default function HospitalRecordsPage() {
   const params = useParams();
   const router = useRouter();
@@ -42,11 +66,18 @@ export default function HospitalRecordsPage() {
         : "";
 
   const [patient, setPatient] = useState<Patient | null>(null);
+  const [emergencyProfile, setEmergencyProfile] =
+    useState<EmergencyProfile | null>(null);
   const [records, setRecords] = useState<RecordItem[]>([]);
-  const [insurancePolicies, setInsurancePolicies] = useState<InsurancePolicy[]>([]);
+  const [insurancePolicies, setInsurancePolicies] = useState<InsurancePolicy[]>(
+    []
+  );
   const [grantId, setGrantId] = useState("");
   const [loading, setLoading] = useState(true);
   const [opening, setOpening] = useState<string | null>(null);
+  const [generatingSummary, setGeneratingSummary] = useState(false);
+  const [aiSummary, setAiSummary] = useState<AISummary | null>(null);
+  const [aiError, setAiError] = useState("");
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -65,7 +96,9 @@ export default function HospitalRecordsPage() {
         );
 
         if (!storedGrant) {
-          setError("Hospital verification is required before private records can be viewed.");
+          setError(
+            "Hospital verification is required before private records can be viewed."
+          );
           setLoading(false);
           return;
         }
@@ -80,12 +113,8 @@ export default function HospitalRecordsPage() {
         if (recordsError) throw recordsError;
 
         const result = Array.isArray(data) ? data : [];
-
-        if (!result.length && !result[0]) {
-          // Empty is valid; authorization is still checked by the RPC.
-        }
-
         const first = result[0];
+
         if (first?.access_denied) {
           throw new Error("Hospital access has expired or been revoked.");
         }
@@ -109,7 +138,15 @@ export default function HospitalRecordsPage() {
 
         setPatient({
           member_id: profile.member_id,
-          full_name: profile.full_name,
+          full_name: profile.full_name ?? null,
+        });
+
+        setEmergencyProfile({
+          blood_group: profile.blood_group ?? null,
+          allergies: profile.allergies ?? null,
+          critical_medications: profile.critical_medications ?? null,
+          medical_conditions: profile.medical_conditions ?? null,
+          emergency_notes: profile.emergency_notes ?? null,
         });
 
         const { data: insuranceData, error: insuranceError } =
@@ -122,8 +159,6 @@ export default function HospitalRecordsPage() {
             .order("created_at", { ascending: false });
 
         if (insuranceError) {
-          // Insurance is an additional section. Do not block authorized
-          // medical-record access if the insurance query fails.
           console.error("Insurance load error:", insuranceError);
           setInsurancePolicies([]);
         } else {
@@ -181,21 +216,280 @@ export default function HospitalRecordsPage() {
     }
   }
 
+  function getRecordMimeType(filePath: string) {
+    const clean = (filePath || "").split("?")[0].toLowerCase();
+    const extension = clean.includes(".")
+      ? clean.slice(clean.lastIndexOf(".") + 1)
+      : "";
+
+    const map: Record<string, string> = {
+      pdf: "application/pdf",
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      png: "image/png",
+      webp: "image/webp",
+      gif: "image/gif",
+    };
+
+    return map[extension] || "";
+  }
+
+  async function getRecordSignedUrl(record: RecordItem) {
+    if (!grantId) {
+      throw new Error("Hospital authorization is missing or expired.");
+    }
+
+    const response = await fetch("/api/hospital-record", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_id: grantId,
+        record_id: record.id,
+      }),
+    });
+
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok || !payload.signedUrl) {
+      throw new Error(
+        payload.error || "This medical document could not be accessed."
+      );
+    }
+
+    return payload.signedUrl as string;
+  }
+
+  function getAISummaryCacheKey() {
+    return `${AI_CACHE_PREFIX}${token}:${JSON.stringify({
+      patientId: patient?.member_id || "",
+      profile: emergencyProfile,
+      records: records.map((record) => ({
+        id: record.id,
+        title: record.title,
+        record_type: record.record_type,
+        record_date: record.record_date,
+        file_path: record.file_path,
+        created_at: record.created_at,
+      })),
+    })}`;
+  }
+
+  function readCachedAISummary(): AISummary | null {
+    try {
+      const raw = sessionStorage.getItem(getAISummaryCacheKey());
+      if (!raw) return null;
+
+      const cached = JSON.parse(raw) as {
+        savedAt: number;
+        summary: AISummary;
+      };
+
+      if (!cached?.savedAt || Date.now() - cached.savedAt > AI_CACHE_TTL_MS) {
+        sessionStorage.removeItem(getAISummaryCacheKey());
+        return null;
+      }
+
+      return cached.summary || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveCachedAISummary(summary: AISummary) {
+    try {
+      sessionStorage.setItem(
+        getAISummaryCacheKey(),
+        JSON.stringify({ savedAt: Date.now(), summary })
+      );
+    } catch {
+      // Cache is an optimization only; never block the medical-record flow.
+    }
+  }
+
+  async function generateAISummary(forceRefresh = false) {
+    if (!patient) {
+      setAiError("Patient information is not available.");
+      return;
+    }
+
+    if (!emergencyProfile) {
+      setAiError("Emergency information is not available.");
+      return;
+    }
+
+    if (!forceRefresh) {
+      const cachedSummary = readCachedAISummary();
+      if (cachedSummary) {
+        setAiError("");
+        setAiSummary(cachedSummary);
+        return;
+      }
+    }
+
+    const createLocalFallbackSummary = (): AISummary => {
+      const bloodGroup = emergencyProfile.blood_group?.trim();
+      const allergies = emergencyProfile.allergies?.trim();
+      const medications = emergencyProfile.critical_medications?.trim();
+      const conditions = emergencyProfile.medical_conditions?.trim();
+      const notes = emergencyProfile.emergency_notes?.trim();
+
+      const criticalAlerts: string[] = [
+        `Blood group: ${bloodGroup || "Not provided"}`,
+        `Allergies: ${allergies || "Not provided"}`,
+      ];
+
+      if (notes) {
+        criticalAlerts.push(`Emergency notes: ${notes}`);
+      }
+
+      return {
+        headline: `Emergency Summary — ${patient.full_name || "Patient"}`,
+        summary:
+          `Blood group: ${bloodGroup || "Not provided"}. ` +
+          `Allergies: ${allergies || "Not provided"}. ` +
+          `Critical medications: ${medications || "Not provided"}. ` +
+          `Medical conditions: ${conditions || "Not provided"}.`,
+        criticalAlerts,
+        medications: [medications || "Not provided"],
+        conditions: [conditions || "Not provided"],
+        documentFindings: [],
+        documentsProcessed: 0,
+        documentsSkipped:
+          records.length > 0
+            ? [
+                "Document analysis was unavailable. Verify the original medical documents.",
+              ]
+            : [],
+        verificationNote:
+          "Gemini is temporarily unavailable. This fallback summary is generated directly from the patient's MediKey emergency profile and is not an AI-generated clinical assessment. Verify the original records before making clinical decisions.",
+        isFallback: true,
+      };
+    };
+
+    try {
+      setGeneratingSummary(true);
+      setAiError("");
+
+      // Only documents already returned by the authorized hospital-access RPC
+      // are considered. We obtain short-lived signed URLs through the same
+      // protected endpoint used by the Open buttons.
+      const documentCandidates = records
+        .map((record) => ({
+          record,
+          mimeType: getRecordMimeType(record.file_path),
+        }))
+        .filter((item) => Boolean(item.mimeType));
+
+      const documentResults = await Promise.allSettled(
+        documentCandidates.map(async ({ record, mimeType }) => ({
+          title: record.title || "Medical document",
+          record_type: record.record_type,
+          record_date: record.record_date,
+          mimeType,
+          signedUrl: await getRecordSignedUrl(record),
+        }))
+      );
+
+      const documents = documentResults
+        .filter(
+          (
+            result
+          ): result is PromiseFulfilledResult<{
+            title: string;
+            record_type: string | null;
+            record_date: string | null;
+            mimeType: string;
+            signedUrl: string;
+          }> => result.status === "fulfilled"
+        )
+        .map((result) => result.value);
+
+      const skippedDocumentAccess = documentResults
+        .filter(
+          (result): result is PromiseRejectedResult =>
+            result.status === "rejected"
+        )
+        .map((result) =>
+          result.reason instanceof Error
+            ? result.reason.message
+            : "A medical document could not be accessed."
+        );
+
+      const unsupportedDocuments = records
+        .filter((record) => !getRecordMimeType(record.file_path))
+        .map(
+          (record) =>
+            `${record.title || "Medical document"}: unsupported file type for document analysis.`
+        );
+
+      const response = await fetch("/api/gemini/emergency-summary", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          patientName: patient.full_name,
+          emergencyProfile,
+          records: records.map((record) => ({
+            title: record.title,
+            record_type: record.record_type,
+            record_date: record.record_date,
+          })),
+          documents,
+        }),
+      });
+
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok || !payload.success || !payload.summary) {
+        console.warn(
+          "Gemini unavailable. Showing local emergency summary instead.",
+          payload?.error || `HTTP ${response.status}`
+        );
+        setAiSummary(createLocalFallbackSummary());
+        return;
+      }
+
+      const summary = payload.summary as AISummary;
+      const extraSkipped = [...unsupportedDocuments, ...skippedDocumentAccess];
+
+      const finalSummary: AISummary = {
+        ...summary,
+        documentsSkipped: [
+          ...(Array.isArray(summary.documentsSkipped)
+            ? summary.documentsSkipped
+            : []),
+          ...extraSkipped,
+        ],
+        isFallback: false,
+      };
+
+      setAiSummary(finalSummary);
+      saveCachedAISummary(finalSummary);
+    } catch (err) {
+      console.warn(
+        "Gemini/document analysis request failed. Showing local emergency summary instead.",
+        err
+      );
+      setAiError("");
+      setAiSummary(createLocalFallbackSummary());
+    } finally {
+      setGeneratingSummary(false);
+    }
+  }
+
   if (loading) {
     return (
       <>
         <style jsx global>{styles}</style>
-
         <main className="page">
           <div className="center-card">
             <div className="brand-mark">+</div>
             <div className="spinner" />
-
             <h1>Loading medical records</h1>
-
             <p>
-              MediKey is securely preparing the patient's
-              authorized medical information.
+              MediKey is securely preparing the patient's authorized medical
+              information.
             </p>
           </div>
         </main>
@@ -207,23 +501,16 @@ export default function HospitalRecordsPage() {
     return (
       <>
         <style jsx global>{styles}</style>
-
         <main className="page">
           <div className="center-card">
             <div className="error-icon">!</div>
-
             <div className="eyebrow">MEDIKEY</div>
-
             <h1>Records unavailable</h1>
-
             <p>{error}</p>
-
             <button
               className="primary-button"
               onClick={() =>
-                router.push(
-                  `/emergency/${encodeURIComponent(token)}`
-                )
+                router.push(`/emergency/${encodeURIComponent(token)}`)
               }
             >
               Back to Emergency Profile
@@ -240,8 +527,6 @@ export default function HospitalRecordsPage() {
 
       <main className="page">
         <div className="shell">
-
-          {/* HEADER */}
           <header className="header">
             <button
               className="back-button"
@@ -256,12 +541,9 @@ export default function HospitalRecordsPage() {
 
             <div className="brand">
               <div className="brand-mark">+</div>
-
               <div>
                 <div className="brand-name">MediKey</div>
-                <div className="brand-subtitle">
-                  Secure Medical Access
-                </div>
+                <div className="brand-subtitle">Secure Medical Access</div>
               </div>
             </div>
 
@@ -271,42 +553,29 @@ export default function HospitalRecordsPage() {
             </div>
           </header>
 
-          {/* HERO */}
           <section className="hero">
             <div className="hero-icon">📋</div>
-
-            <div className="eyebrow">
-              AUTHORIZED MEDICAL RECORDS
-            </div>
-
-            <h1>
-              {patient?.full_name || "Patient"}'s records
-            </h1>
-
+            <div className="eyebrow">AUTHORIZED MEDICAL RECORDS</div>
+            <h1>{patient?.full_name || "Patient"}'s records</h1>
             <p>
-              Private medical information associated with this
-              MediKey profile.
+              Private medical information associated with this MediKey
+              profile.
             </p>
           </section>
 
-          {/* SECURITY BANNER */}
           <section className="security-card">
             <div className="security-icon">🔐</div>
-
             <div>
               <div className="security-title">
                 Protected medical information
               </div>
-
               <div className="security-text">
-                These records are private. Access should only be
-                used by authorized healthcare personnel for
-                legitimate patient care.
+                These records are private. Access should only be used by
+                authorized healthcare personnel for legitimate patient care.
               </div>
             </div>
           </section>
 
-          {/* ERROR */}
           {error && (
             <div className="error-message">
               <strong>Access notice</strong>
@@ -314,19 +583,197 @@ export default function HospitalRecordsPage() {
             </div>
           )}
 
+          {/* AI EMERGENCY SUMMARY */}
+          <section className="ai-card">
+            <div className="ai-header">
+              <div className="ai-heading">
+                <div className="ai-icon">✦</div>
+                <div>
+                  <div className="section-label">AI-ASSISTED CLINICAL VIEW</div>
+                  <h2>Emergency Summary</h2>
+                </div>
+              </div>
+
+              <span className="ai-badge">Gemini</span>
+            </div>
+
+            <p className="ai-description">
+              Generate a concise emergency summary using the patient's MediKey
+              profile and, when available, authorized medical documents such
+              as PDFs and uploaded report images.
+            </p>
+
+            {!aiSummary && (
+              <button
+                className="ai-generate-button"
+                onClick={() => generateAISummary(false)}
+                disabled={generatingSummary}
+              >
+                {generatingSummary ? (
+                  <>
+                    <span className="mini-spinner" />
+                    Generating summary...
+                  </>
+                ) : (
+                  <>
+                    <span>✦</span>
+                    Generate AI Emergency Summary
+                  </>
+                )}
+              </button>
+            )}
+
+            {aiError && (
+              <div className="ai-error">
+                <strong>Summary unavailable</strong>
+                <span>{aiError}</span>
+              </div>
+            )}
+
+            {aiSummary && (
+              <div className="ai-result">
+                <div className="ai-result-head">
+                  <div>
+                    <div className="ai-result-label">
+                      {aiSummary.isFallback
+                        ? "EMERGENCY PROFILE OVERVIEW"
+                        : "AI-GENERATED OVERVIEW"}
+                    </div>
+                    <h3>{aiSummary.headline}</h3>
+                  </div>
+
+                  <button
+                    className="ai-regenerate"
+                    onClick={() => generateAISummary(true)}
+                    disabled={generatingSummary}
+                  >
+                    {generatingSummary ? "Updating..." : "Regenerate"}
+                  </button>
+                </div>
+
+                <p className="ai-summary-text">{aiSummary.summary}</p>
+
+                {(aiSummary.documentFindings?.length ||
+                  aiSummary.documentsProcessed) ? (
+                  <div className="ai-documents">
+                    <div className="ai-documents-head">
+                      <div>
+                        <div className="ai-list-title">
+                          <span className="ai-list-dot">📄</span>
+                          Document findings
+                        </div>
+                        <div className="ai-documents-subtitle">
+                          {aiSummary.documentsProcessed || 0} authorized
+                          document
+                          {(aiSummary.documentsProcessed || 0) === 1
+                            ? ""
+                            : "s"}{" "}
+                          analyzed
+                        </div>
+                      </div>
+                    </div>
+
+                    {aiSummary.documentFindings?.length ? (
+                      <ul className="ai-document-list">
+                        {aiSummary.documentFindings.map((item, index) => (
+                          <li key={`document-finding-${index}`}>{item}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="ai-empty">
+                        No specific findings were extracted from the documents.
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+
+                {aiSummary.documentsSkipped?.length ? (
+                  <div className="ai-documents-warning">
+                    <span>ⓘ</span>
+                    <div>
+                      <strong>Some documents were not analyzed</strong>
+                      <ul>
+                        {aiSummary.documentsSkipped.map((item, index) => (
+                          <li key={`document-skip-${index}`}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                ) : null}
+
+                <div className="ai-grid">
+                  <div className="ai-list-card critical">
+                    <div className="ai-list-title">
+                      <span className="ai-list-dot">!</span>
+                      Critical alerts
+                    </div>
+                    {aiSummary.criticalAlerts.length ? (
+                      <ul>
+                        {aiSummary.criticalAlerts.map((item, index) => (
+                          <li key={`alert-${index}`}>{item}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="ai-empty">No documented alerts.</div>
+                    )}
+                  </div>
+
+                  <div className="ai-list-card">
+                    <div className="ai-list-title">
+                      <span className="ai-list-dot">+</span>
+                      Medications
+                    </div>
+                    {aiSummary.medications.length ? (
+                      <ul>
+                        {aiSummary.medications.map((item, index) => (
+                          <li key={`med-${index}`}>{item}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="ai-empty">
+                        No medications documented.
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="ai-list-card">
+                    <div className="ai-list-title">
+                      <span className="ai-list-dot">•</span>
+                      Conditions
+                    </div>
+                    {aiSummary.conditions.length ? (
+                      <ul>
+                        {aiSummary.conditions.map((item, index) => (
+                          <li key={`condition-${index}`}>{item}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="ai-empty">
+                        No conditions documented.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="ai-safety">
+                  <span>ⓘ</span>
+                  <div>
+                    <strong>Verification required</strong>
+                    <p>{aiSummary.verificationNote}</p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </section>
+
           {/* RECORDS */}
           <section className="records-card">
             <div className="records-header">
               <div>
-                <div className="section-label">
-                  MEDICAL DOCUMENTS
-                </div>
-
+                <div className="section-label">MEDICAL DOCUMENTS</div>
                 <h2>
                   {records.length}{" "}
-                  {records.length === 1
-                    ? "record"
-                    : "records"}
+                  {records.length === 1 ? "record" : "records"}
                 </h2>
               </div>
             </div>
@@ -334,43 +781,29 @@ export default function HospitalRecordsPage() {
             {records.length === 0 ? (
               <div className="empty-state">
                 <div className="empty-icon">📄</div>
-
                 <h3>No medical records</h3>
-
                 <p>
-                  No medical documents have been uploaded for
-                  this patient yet.
+                  No medical documents have been uploaded for this patient
+                  yet.
                 </p>
               </div>
             ) : (
               <div className="record-list">
                 {records.map((record) => (
-                  <article
-                    className="record-item"
-                    key={record.id}
-                  >
+                  <article className="record-item" key={record.id}>
                     <div className="record-icon">📄</div>
 
                     <div className="record-info">
-                      <h3>
-                        {record.title || "Medical Record"}
-                      </h3>
-
+                      <h3>{record.title || "Medical Record"}</h3>
                       <div className="record-meta">
                         <span>
-                          {record.record_type ||
-                            "Medical document"}
+                          {record.record_type || "Medical document"}
                         </span>
 
                         {record.record_date && (
                           <>
                             <span>•</span>
-
-                            <span>
-                              {formatDate(
-                                record.record_date
-                              )}
-                            </span>
+                            <span>{formatDate(record.record_date)}</span>
                           </>
                         )}
                       </div>
@@ -381,9 +814,7 @@ export default function HospitalRecordsPage() {
                       disabled={opening === record.id}
                       onClick={() => openRecord(record)}
                     >
-                      {opening === record.id
-                        ? "Opening..."
-                        : "Open"}
+                      {opening === record.id ? "Opening..." : "Open"}
                     </button>
                   </article>
                 ))}
@@ -395,26 +826,22 @@ export default function HospitalRecordsPage() {
           <section className="insurance-card">
             <div className="insurance-header">
               <div className="insurance-heading">
-                <div className="insurance-icon">🛡️</div>
+                <div className="insurance-icon">🛡</div>
                 <div>
                   <div className="section-label">INSURANCE</div>
                   <h2>
                     {insurancePolicies.length}{" "}
-                    {insurancePolicies.length === 1
-                      ? "policy"
-                      : "policies"}
+                    {insurancePolicies.length === 1 ? "policy" : "policies"}
                   </h2>
                 </div>
               </div>
 
-              <div className="insurance-private-pill">
-                Authorized view
-              </div>
+              <div className="insurance-private-pill">Authorized view</div>
             </div>
 
             {insurancePolicies.length === 0 ? (
               <div className="insurance-empty">
-                <div className="insurance-empty-icon">🛡️</div>
+                <div className="insurance-empty-icon">🛡</div>
                 <div>
                   <h3>No insurance information added</h3>
                   <p>
@@ -439,7 +866,9 @@ export default function HospitalRecordsPage() {
                           </div>
                         </div>
 
-                        <span className={`insurance-status ${status.className}`}>
+                        <span
+                          className={`insurance-status ${status.className}`}
+                        >
                           {status.label}
                         </span>
                       </div>
@@ -447,17 +876,23 @@ export default function HospitalRecordsPage() {
                       <div className="insurance-grid">
                         <div className="insurance-detail">
                           <span>Policy number</span>
-                          <strong>{maskPolicyNumber(policy.policy_number)}</strong>
+                          <strong>
+                            {maskPolicyNumber(policy.policy_number)}
+                          </strong>
                         </div>
 
                         <div className="insurance-detail">
                           <span>Policy holder</span>
-                          <strong>{policy.policy_holder_name || "Not specified"}</strong>
+                          <strong>
+                            {policy.policy_holder_name || "Not specified"}
+                          </strong>
                         </div>
 
                         <div className="insurance-detail">
                           <span>Coverage</span>
-                          <strong>{formatCoverage(policy.coverage_amount)}</strong>
+                          <strong>
+                            {formatCoverage(policy.coverage_amount)}
+                          </strong>
                         </div>
 
                         <div className="insurance-detail">
@@ -491,19 +926,13 @@ export default function HospitalRecordsPage() {
             </div>
           </section>
 
-          {/* PRIVACY */}
           <section className="privacy-card">
             <div className="privacy-icon">✓</div>
-
             <div>
-              <div className="privacy-title">
-                MediKey privacy layer
-              </div>
-
+              <div className="privacy-title">MediKey privacy layer</div>
               <div className="privacy-text">
-                Emergency information is separate from private
-                medical records. Record access should be
-                authorized and auditable.
+                Emergency information is separate from private medical
+                records. Record access should be authorized and auditable.
               </div>
             </div>
           </section>
@@ -513,12 +942,8 @@ export default function HospitalRecordsPage() {
               <span>+</span>
               MediKey
             </div>
-
-            <div>
-              When you can't speak, MediKey speaks for you.
-            </div>
+            <div>When you can't speak, MediKey speaks for you.</div>
           </footer>
-
         </div>
       </main>
     </>
@@ -526,9 +951,7 @@ export default function HospitalRecordsPage() {
 }
 
 function formatDate(date: string | null) {
-  if (!date) {
-    return "Not specified";
-  }
+  if (!date) return "Not specified";
 
   const parsed = new Date(date);
 
@@ -626,29 +1049,23 @@ body {
   margin: 0;
   background: var(--ivory);
   color: var(--charcoal);
-  font-family:
-    Inter,
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
 button {
   font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
 }
 
 .page {
   min-height: 100vh;
   padding: 22px 16px 45px;
   background:
-    radial-gradient(
-      circle at 50% -10%,
-      rgba(230,243,239,.95),
-      transparent 42%
-    ),
+    radial-gradient(circle at 50% -10%, rgba(230,243,239,.95), transparent 42%),
     var(--ivory);
 }
 
@@ -744,8 +1161,8 @@ button {
 
 .eyebrow,
 .section-label {
-  color: var(--sage);
-  font-size: 10px;
+  color: var(--teal);
+  font-size: 9px;
   font-weight: 900;
   letter-spacing: .13em;
 }
@@ -766,21 +1183,452 @@ button {
 
 .security-card,
 .records-card,
-.insurance-card {
-  margin-top: 15px;
-  padding: 21px;
+.insurance-card,
+.ai-card,
+.privacy-card {
   background: white;
   border: 1px solid var(--border);
   border-radius: 20px;
   box-shadow: 0 10px 35px rgba(25,48,47,.055);
 }
 
+.security-card {
+  display: flex;
+  gap: 12px;
+  padding: 16px;
+  margin-bottom: 15px;
+  background: rgba(230,243,239,.6);
+}
+
+.security-icon {
+  width: 39px;
+  height: 39px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  background: white;
+}
+
+.security-title {
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.security-text {
+  margin-top: 3px;
+  color: var(--slate);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.ai-card {
+  margin-top: 15px;
+  padding: 21px;
+  overflow: hidden;
+}
+
+.ai-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+}
+
+.ai-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ai-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 13px;
+  background: linear-gradient(135deg, var(--mint), #edf7f4);
+  color: var(--teal);
+  font-size: 21px;
+  font-weight: 900;
+}
+
+.ai-header h2 {
+  margin: 5px 0 0;
+  font-size: 22px;
+  letter-spacing: -.025em;
+}
+
+.ai-badge {
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--ivory);
+  color: var(--teal);
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.ai-description {
+  margin: 14px 0 15px;
+  color: var(--slate);
+  font-size: 11px;
+  line-height: 1.55;
+  max-width: 680px;
+}
+
+.ai-generate-button {
+  width: 100%;
+  min-height: 46px;
+  border: 0;
+  border-radius: 13px;
+  background: var(--teal);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  font-size: 12px;
+  font-weight: 850;
+  transition: transform .15s ease, opacity .15s ease;
+}
+
+.ai-generate-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.ai-generate-button:disabled {
+  opacity: .68;
+}
+
+.mini-spinner {
+  width: 15px;
+  height: 15px;
+  border: 2px solid rgba(255,255,255,.35);
+  border-top-color: white;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+
+.ai-error {
+  margin-top: 12px;
+  padding: 11px 12px;
+  border-radius: 12px;
+  background: #fff3f4;
+  color: var(--crimson);
+  font-size: 10px;
+}
+
+.ai-error strong,
+.ai-error span {
+  display: block;
+}
+
+.ai-error span {
+  margin-top: 3px;
+}
+
+.ai-result {
+  margin-top: 15px;
+  padding-top: 15px;
+  border-top: 1px solid var(--border);
+}
+
+.ai-result-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 15px;
+}
+
+.ai-result-label {
+  color: var(--teal);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: .13em;
+}
+
+.ai-result h3 {
+  margin: 5px 0 0;
+  font-size: 18px;
+  letter-spacing: -.02em;
+}
+
+.ai-regenerate {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 11px;
+  background: white;
+  color: var(--teal);
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.ai-regenerate:disabled {
+  opacity: .6;
+}
+
+.ai-summary-text {
+  margin: 12px 0 0;
+  color: var(--slate);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.ai-documents {
+  margin: 16px 0;
+  padding: 15px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: #fbfdfc;
+}
+
+.ai-documents-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ai-documents-subtitle {
+  margin-top: 5px;
+  color: var(--slate);
+  font-size: 10px;
+}
+
+.ai-document-list {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  color: var(--charcoal);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.ai-document-list li + li {
+  margin-top: 6px;
+}
+
+.ai-documents-warning {
+  display: flex;
+  gap: 10px;
+  margin: 12px 0 16px;
+  padding: 12px 14px;
+  border: 1px solid #eadfc5;
+  border-radius: 14px;
+  background: #fffaf0;
+  color: #6e5a2f;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.ai-documents-warning > span {
+  flex: 0 0 auto;
+}
+
+.ai-documents-warning ul {
+  margin: 6px 0 0;
+  padding-left: 16px;
+}
+
+.ai-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.ai-list-card {
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fbfdfc;
+}
+
+.ai-list-card.critical {
+  background: #fffafb;
+  border-color: #efdfe2;
+}
+
+.ai-list-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.ai-list-dot {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--mint);
+  color: var(--teal);
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.ai-list-card.critical .ai-list-dot {
+  background: #fde8eb;
+  color: var(--crimson);
+}
+
+.ai-list-card ul {
+  margin: 9px 0 0;
+  padding-left: 16px;
+  color: var(--slate);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.ai-list-card li + li {
+  margin-top: 5px;
+}
+
+.ai-empty {
+  margin-top: 9px;
+  color: var(--slate);
+  font-size: 10px;
+}
+
+.ai-safety {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 12px;
+  padding: 11px 12px;
+  border-radius: 12px;
+  background: rgba(230,243,239,.65);
+  color: var(--slate);
+}
+
+.ai-safety > span {
+  color: var(--teal);
+  font-weight: 900;
+}
+
+.ai-safety strong {
+  display: block;
+  color: var(--charcoal);
+  font-size: 10px;
+}
+
+.ai-safety p {
+  margin: 3px 0 0;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.records-card {
+  margin-top: 15px;
+  padding: 21px;
+}
+
+.records-header,
 .insurance-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 15px;
   margin-bottom: 15px;
+}
+
+.records-header h2,
+.insurance-header h2 {
+  margin: 5px 0 0;
+  font-size: 22px;
+  letter-spacing: -.025em;
+}
+
+.record-list,
+.insurance-list {
+  display: grid;
+  gap: 10px;
+}
+
+.record-item {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 15px;
+  background: #fbfdfc;
+}
+
+.record-icon {
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--mint);
+}
+
+.record-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.record-info h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.record-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+  color: var(--slate);
+  font-size: 10px;
+}
+
+.open-button {
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 10px;
+  padding: 9px 13px;
+  background: var(--teal);
+  color: white;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.open-button:disabled {
+  opacity: .65;
+}
+
+.empty-state {
+  padding: 42px 20px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 16px;
+  background: var(--ivory);
+}
+
+.empty-icon {
+  font-size: 30px;
+}
+
+.empty-state h3 {
+  margin: 10px 0 5px;
+  font-size: 16px;
+}
+
+.empty-state p {
+  margin: 0;
+  color: var(--slate);
+  font-size: 12px;
+}
+
+.insurance-card {
+  margin-top: 15px;
+  padding: 21px;
 }
 
 .insurance-heading {
@@ -800,12 +1648,6 @@ button {
   font-size: 20px;
 }
 
-.insurance-header h2 {
-  margin: 5px 0 0;
-  font-size: 22px;
-  letter-spacing: -.025em;
-}
-
 .insurance-private-pill {
   padding: 7px 10px;
   border: 1px solid var(--border);
@@ -814,11 +1656,6 @@ button {
   color: var(--teal);
   font-size: 10px;
   font-weight: 850;
-}
-
-.insurance-list {
-  display: grid;
-  gap: 10px;
 }
 
 .insurance-item {
@@ -993,143 +1830,6 @@ button {
   line-height: 1.45;
 }
 
-.privacy-card {
-  background: white;
-  border: 1px solid var(--border);
-  border-radius: 20px;
-  box-shadow: 0 10px 35px rgba(25,48,47,.055);
-}
-
-.security-card {
-  display: flex;
-  gap: 12px;
-  padding: 16px;
-  margin-bottom: 15px;
-  background: rgba(230,243,239,.6);
-}
-
-.security-icon {
-  width: 39px;
-  height: 39px;
-  flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  border-radius: 11px;
-  background: white;
-}
-
-.security-title {
-  font-size: 12px;
-  font-weight: 850;
-}
-
-.security-text {
-  margin-top: 3px;
-  color: var(--slate);
-  font-size: 11px;
-  line-height: 1.5;
-}
-
-.records-card {
-  padding: 21px;
-}
-
-.records-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 15px;
-}
-
-.records-header h2 {
-  margin: 5px 0 0;
-  font-size: 22px;
-  letter-spacing: -.025em;
-}
-
-.record-list {
-  display: grid;
-  gap: 10px;
-}
-
-.record-item {
-  display: flex;
-  align-items: center;
-  gap: 13px;
-  padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: 15px;
-  background: #fbfdfc;
-}
-
-.record-icon {
-  width: 42px;
-  height: 42px;
-  flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  border-radius: 12px;
-  background: var(--mint);
-}
-
-.record-info {
-  min-width: 0;
-  flex: 1;
-}
-
-.record-info h3 {
-  margin: 0;
-  font-size: 13px;
-  font-weight: 850;
-}
-
-.record-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 4px;
-  color: var(--slate);
-  font-size: 10px;
-}
-
-.open-button {
-  flex: 0 0 auto;
-  border: 0;
-  border-radius: 10px;
-  padding: 9px 13px;
-  background: var(--teal);
-  color: white;
-  font-size: 11px;
-  font-weight: 800;
-}
-
-.open-button:disabled {
-  opacity: .65;
-}
-
-.empty-state {
-  padding: 42px 20px;
-  text-align: center;
-  border: 1px dashed var(--border);
-  border-radius: 16px;
-  background: var(--ivory);
-}
-
-.empty-icon {
-  font-size: 30px;
-}
-
-.empty-state h3 {
-  margin: 10px 0 5px;
-  font-size: 16px;
-}
-
-.empty-state p {
-  margin: 0;
-  color: var(--slate);
-  font-size: 12px;
-}
-
 .error-message {
   margin-bottom: 13px;
   padding: 12px;
@@ -1235,9 +1935,7 @@ footer {
 }
 
 @keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
+  to { transform: rotate(360deg); }
 }
 
 .error-icon {
@@ -1262,6 +1960,12 @@ footer {
   color: white;
   font-size: 12px;
   font-weight: 800;
+}
+
+@media (max-width: 700px) {
+  .ai-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 600px) {
@@ -1314,6 +2018,14 @@ footer {
 
   .open-button {
     padding: 8px 10px;
+  }
+
+  .ai-result-head {
+    flex-direction: column;
+  }
+
+  .ai-regenerate {
+    width: 100%;
   }
 
   footer {
