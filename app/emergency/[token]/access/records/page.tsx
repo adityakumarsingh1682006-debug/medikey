@@ -38,6 +38,23 @@ type InsurancePolicy = {
   customer_care_phone: string | null;
 };
 
+type SensitiveAccessRequest = {
+  request_id: string;
+  member_id: string;
+  member_name: string | null;
+  hospital_id: string;
+  hospital_name: string;
+  hospital_city: string | null;
+  reason: string | null;
+  access_scope: string[];
+  status: "pending" | "approved" | "denied" | "expired" | "revoked";
+  requested_at: string;
+  approved_at: string | null;
+  denied_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+};
+
 const AI_CACHE_TTL_MS = 15 * 60 * 1000;
 const AI_CACHE_PREFIX = "medikey-ai-summary:";
 
@@ -79,6 +96,12 @@ export default function HospitalRecordsPage() {
   const [aiSummary, setAiSummary] = useState<AISummary | null>(null);
   const [aiError, setAiError] = useState("");
   const [error, setError] = useState("");
+  const [sensitiveRequest, setSensitiveRequest] =
+    useState<SensitiveAccessRequest | null>(null);
+  const [sensitiveLoading, setSensitiveLoading] = useState(false);
+  const [sensitiveSubmitting, setSensitiveSubmitting] = useState(false);
+  const [sensitiveReason, setSensitiveReason] = useState("");
+  const [sensitiveMessage, setSensitiveMessage] = useState("");
 
   useEffect(() => {
     async function loadRecords() {
@@ -149,21 +172,10 @@ export default function HospitalRecordsPage() {
           emergency_notes: profile.emergency_notes ?? null,
         });
 
-        const { data: insuranceData, error: insuranceError } =
-          await supabase
-            .from("insurance_policies")
-            .select(
-              "id, provider_name, policy_number, policy_type, policy_holder_name, coverage_amount, valid_from, valid_until, customer_care_phone"
-            )
-            .eq("member_id", profile.member_id)
-            .order("created_at", { ascending: false });
-
-        if (insuranceError) {
-          console.error("Insurance load error:", insuranceError);
-          setInsurancePolicies([]);
-        } else {
-          setInsurancePolicies((insuranceData ?? []) as InsurancePolicy[]);
-        }
+        // Insurance is treated as highly sensitive data.
+        // It is intentionally NOT loaded during normal hospital access.
+        // It will only be requested after the patient grants sensitive access.
+        setInsurancePolicies([]);
       } catch (err) {
         console.error("Hospital records error:", err);
         setError(
@@ -215,6 +227,195 @@ export default function HospitalRecordsPage() {
       setOpening(null);
     }
   }
+
+  async function loadSensitiveAccessRequest() {
+    if (!patient?.member_id) return;
+
+    try {
+      setSensitiveLoading(true);
+      setSensitiveMessage("");
+
+      const { data, error: requestError } = await supabase.rpc(
+        "get_hospital_sensitive_access_status",
+        {
+          p_token: token,
+          p_grant_id: grantId,
+        }
+      );
+
+      if (requestError) {
+        throw requestError;
+      }
+
+      const result = Array.isArray(data) ? data[0] : data;
+      setSensitiveRequest(
+        result ? (result as SensitiveAccessRequest) : null
+      );
+    } catch (err) {
+      console.error("Sensitive access status error:", err);
+      // Do not block normal authorized records if the status helper is not
+      // available. The request action below remains independently protected.
+    } finally {
+      setSensitiveLoading(false);
+    }
+  }
+
+  async function requestSensitiveAccess() {
+    if (!token || !grantId || !patient?.member_id) {
+      setSensitiveMessage("Hospital authorization is missing or expired.");
+      return;
+    }
+
+    const reason = sensitiveReason.trim();
+
+    if (!reason) {
+      setSensitiveMessage(
+        "Please enter a reason before requesting highly sensitive access."
+      );
+      return;
+    }
+
+    try {
+      setSensitiveSubmitting(true);
+      setSensitiveMessage("");
+
+      const { data, error: requestError } = await supabase.rpc(
+        "create_sensitive_access_request",
+        {
+          p_token: token,
+          p_grant_id: grantId,
+          p_access_scope: ["highly_sensitive", "insurance"],
+          p_reason: reason,
+        }
+      );
+
+      if (requestError) {
+        throw requestError;
+      }
+
+      const result = Array.isArray(data) ? data[0] : data;
+
+      if (!result?.request_id) {
+        throw new Error("The sensitive-access request could not be created.");
+      }
+
+      setSensitiveRequest({
+        request_id: result.request_id,
+        member_id: result.member_id,
+        member_name: patient.full_name,
+        hospital_id: result.hospital_id,
+        hospital_name: result.hospital_name,
+        hospital_city: result.hospital_city,
+        reason,
+        access_scope: result.access_scope || ["highly_sensitive", "insurance"],
+        status: result.status,
+        requested_at: new Date().toISOString(),
+        approved_at: null,
+        denied_at: null,
+        expires_at: null,
+        revoked_at: null,
+      });
+
+      setSensitiveMessage(
+        "Request sent. The patient must approve access before highly sensitive information is unlocked."
+      );
+      setSensitiveReason("");
+    } catch (err) {
+      console.error("Sensitive access request error:", err);
+      setSensitiveMessage(
+        err instanceof Error && err.message
+          ? err.message
+          : "We couldn't send the sensitive-access request."
+      );
+    } finally {
+      setSensitiveSubmitting(false);
+    }
+  }
+
+  function hasActiveSensitiveApproval() {
+    return Boolean(
+      sensitiveRequest?.status === "approved" &&
+        sensitiveRequest.expires_at &&
+        new Date(sensitiveRequest.expires_at).getTime() > Date.now()
+    );
+  }
+
+  async function loadApprovedInsurance() {
+    if (!hasActiveSensitiveApproval() || !token || !grantId) {
+      setInsurancePolicies([]);
+      return;
+    }
+
+    try {
+      const { data, error: insuranceError } = await supabase.rpc(
+        "get_hospital_sensitive_insurance",
+        {
+          p_token: token,
+          p_grant_id: grantId,
+        }
+      );
+
+      if (insuranceError) {
+        throw insuranceError;
+      }
+
+      setInsurancePolicies((data ?? []) as InsurancePolicy[]);
+    } catch (err) {
+      console.error("Sensitive insurance load error:", err);
+      setInsurancePolicies([]);
+      setSensitiveMessage(
+        err instanceof Error
+          ? err.message
+          : "Sensitive insurance information could not be loaded."
+      );
+    }
+  }
+
+  function formatSensitiveExpiry(value: string | null) {
+    if (!value) return "Not available";
+
+    return new Date(value).toLocaleString("en-IN", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+  }
+
+  function getSensitiveStatusLabel() {
+    if (!sensitiveRequest) return "Patient approval required";
+
+    if (
+      sensitiveRequest.status === "approved" &&
+      sensitiveRequest.expires_at &&
+      new Date(sensitiveRequest.expires_at).getTime() > Date.now()
+    ) {
+      return "Access approved";
+    }
+
+    if (sensitiveRequest.status === "pending") return "Waiting for approval";
+    if (sensitiveRequest.status === "denied") return "Request denied";
+    if (sensitiveRequest.status === "revoked") return "Access revoked";
+    if (sensitiveRequest.status === "expired") return "Access expired";
+
+    return "Patient approval required";
+  }
+
+  useEffect(() => {
+    if (patient?.member_id) {
+      loadSensitiveAccessRequest();
+    }
+  }, [patient?.member_id]);
+
+  useEffect(() => {
+    if (hasActiveSensitiveApproval()) {
+      loadApprovedInsurance();
+    } else {
+      setInsurancePolicies([]);
+    }
+  }, [
+    sensitiveRequest?.status,
+    sensitiveRequest?.expires_at,
+    patient?.member_id,
+  ]);
 
   function getRecordMimeType(filePath: string) {
     const clean = (filePath || "").split("?")[0].toLowerCase();
@@ -822,108 +1023,227 @@ export default function HospitalRecordsPage() {
             )}
           </section>
 
-          {/* INSURANCE */}
+          {/* INSURANCE / HIGHLY SENSITIVE DATA */}
           <section className="insurance-card">
             <div className="insurance-header">
               <div className="insurance-heading">
                 <div className="insurance-icon">🛡</div>
                 <div>
-                  <div className="section-label">INSURANCE</div>
-                  <h2>
-                    {insurancePolicies.length}{" "}
-                    {insurancePolicies.length === 1 ? "policy" : "policies"}
-                  </h2>
+                  <div className="section-label">HIGHLY SENSITIVE DATA</div>
+                  <h2>Insurance & protected information</h2>
                 </div>
               </div>
 
-              <div className="insurance-private-pill">Authorized view</div>
+              <div className="insurance-private-pill">
+                {getSensitiveStatusLabel()}
+              </div>
             </div>
 
-            {insurancePolicies.length === 0 ? (
-              <div className="insurance-empty">
-                <div className="insurance-empty-icon">🛡</div>
+            {!hasActiveSensitiveApproval() ? (
+              <div className="sensitive-lock-card">
+                <div className="sensitive-lock-icon">🔐</div>
                 <div>
-                  <h3>No insurance information added</h3>
+                  <h3>Patient approval required</h3>
                   <p>
-                    No insurance policy has been stored for this MediKey
-                    profile.
+                    Insurance and other highly sensitive information are not
+                    included in normal hospital access. The patient must
+                    explicitly approve this request.
                   </p>
                 </div>
               </div>
             ) : (
-              <div className="insurance-list">
-                {insurancePolicies.map((policy) => {
-                  const status = getInsuranceStatus(policy.valid_until);
+              <>
+                <div className="sensitive-approved-banner">
+                  <span>✓</span>
+                  <div>
+                    <strong>Highly sensitive access is active</strong>
+                    <p>
+                      Authorized until{" "}
+                      {formatSensitiveExpiry(sensitiveRequest?.expires_at || null)}.
+                    </p>
+                  </div>
+                </div>
 
-                  return (
-                    <article className="insurance-item" key={policy.id}>
-                      <div className="insurance-item-top">
-                        <div className="insurance-provider">
-                          <div className="insurance-provider-icon">✓</div>
-                          <div>
-                            <h3>{policy.provider_name}</h3>
-                            <p>{policy.policy_type}</p>
+                {insurancePolicies.length === 0 ? (
+                  <div className="insurance-empty">
+                    <div className="insurance-empty-icon">🛡</div>
+                    <div>
+                      <h3>No insurance information added</h3>
+                      <p>
+                        No insurance policy has been stored for this MediKey
+                        profile.
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="insurance-list">
+                    {insurancePolicies.map((policy) => {
+                      const status = getInsuranceStatus(policy.valid_until);
+
+                      return (
+                        <article className="insurance-item" key={policy.id}>
+                          <div className="insurance-item-top">
+                            <div className="insurance-provider">
+                              <div className="insurance-provider-icon">✓</div>
+                              <div>
+                                <h3>{policy.provider_name}</h3>
+                                <p>{policy.policy_type}</p>
+                              </div>
+                            </div>
+
+                            <span
+                              className={`insurance-status ${status.className}`}
+                            >
+                              {status.label}
+                            </span>
                           </div>
-                        </div>
 
-                        <span
-                          className={`insurance-status ${status.className}`}
-                        >
-                          {status.label}
-                        </span>
-                      </div>
+                          <div className="insurance-grid">
+                            <div className="insurance-detail">
+                              <span>Policy number</span>
+                              <strong>
+                                {maskPolicyNumber(policy.policy_number)}
+                              </strong>
+                            </div>
 
-                      <div className="insurance-grid">
-                        <div className="insurance-detail">
-                          <span>Policy number</span>
-                          <strong>
-                            {maskPolicyNumber(policy.policy_number)}
-                          </strong>
-                        </div>
+                            <div className="insurance-detail">
+                              <span>Policy holder</span>
+                              <strong>
+                                {policy.policy_holder_name || "Not specified"}
+                              </strong>
+                            </div>
 
-                        <div className="insurance-detail">
-                          <span>Policy holder</span>
-                          <strong>
-                            {policy.policy_holder_name || "Not specified"}
-                          </strong>
-                        </div>
+                            <div className="insurance-detail">
+                              <span>Coverage</span>
+                              <strong>
+                                {formatCoverage(policy.coverage_amount)}
+                              </strong>
+                            </div>
 
-                        <div className="insurance-detail">
-                          <span>Coverage</span>
-                          <strong>
-                            {formatCoverage(policy.coverage_amount)}
-                          </strong>
-                        </div>
+                            <div className="insurance-detail">
+                              <span>Valid until</span>
+                              <strong>{formatDate(policy.valid_until)}</strong>
+                            </div>
+                          </div>
 
-                        <div className="insurance-detail">
-                          <span>Valid until</span>
-                          <strong>{formatDate(policy.valid_until)}</strong>
-                        </div>
-                      </div>
-
-                      {policy.customer_care_phone && (
-                        <a
-                          className="insurance-call"
-                          href={`tel:${policy.customer_care_phone}`}
-                        >
-                          Call insurance support
-                          <span>→</span>
-                        </a>
-                      )}
-                    </article>
-                  );
-                })}
-              </div>
+                          {policy.customer_care_phone && (
+                            <a
+                              className="insurance-call"
+                              href={`tel:${policy.customer_care_phone}`}
+                            >
+                              Call insurance support
+                              <span>→</span>
+                            </a>
+                          )}
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
             )}
 
             <div className="insurance-notice">
               <span>🔒</span>
               <p>
-                Insurance details are shown here because this page is inside
-                the authorized hospital-access flow. The public emergency QR
-                page does not expose these private policy details.
+                Highly sensitive information is separate from normal medical
+                records and requires explicit patient approval.
               </p>
             </div>
+          </section>
+
+          {/* HIGHLY SENSITIVE ACCESS REQUEST */}
+          <section className="sensitive-access-card">
+            <div className="sensitive-access-header">
+              <div className="sensitive-access-heading">
+                <div className="sensitive-access-icon">🔐</div>
+                <div>
+                  <div className="section-label">PATIENT-CONTROLLED ACCESS</div>
+                  <h2>Request Highly Sensitive Access</h2>
+                </div>
+              </div>
+
+              <span className="sensitive-status-pill">
+                {getSensitiveStatusLabel()}
+              </span>
+            </div>
+
+            <p className="sensitive-access-description">
+              This is a separate permission layer for information that should
+              not be available through ordinary hospital verification.
+            </p>
+
+            {sensitiveLoading ? (
+              <div className="sensitive-loading">
+                Checking access authorization...
+              </div>
+            ) : hasActiveSensitiveApproval() ? (
+              <div className="sensitive-active">
+                <div className="sensitive-active-icon">✓</div>
+                <div>
+                  <strong>Access approved by the patient</strong>
+                  <p>
+                    Highly sensitive access is currently active and will expire
+                    at{" "}
+                    {formatSensitiveExpiry(
+                      sensitiveRequest?.expires_at || null
+                    )}
+                    .
+                  </p>
+                </div>
+              </div>
+            ) : sensitiveRequest?.status === "pending" ? (
+              <div className="sensitive-pending">
+                <div className="sensitive-pending-icon">⌛</div>
+                <div>
+                  <strong>Waiting for patient approval</strong>
+                  <p>
+                    The request has been sent to the patient. Nothing in the
+                    highly sensitive section will be unlocked until approval.
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="sensitive-scope">
+                  <div>
+                    <span>Requested access</span>
+                    <strong>Highly sensitive information</strong>
+                  </div>
+                  <div>
+                    <span>Additional protected data</span>
+                    <strong>Insurance</strong>
+                  </div>
+                </div>
+
+                <label className="sensitive-reason-label">
+                  Reason for access
+                  <textarea
+                    value={sensitiveReason}
+                    onChange={(event) => setSensitiveReason(event.target.value)}
+                    placeholder="Explain why this sensitive information is needed for the patient's care."
+                    rows={4}
+                    disabled={sensitiveSubmitting}
+                  />
+                </label>
+
+                <button
+                  className="sensitive-request-button"
+                  onClick={requestSensitiveAccess}
+                  disabled={sensitiveSubmitting || !grantId}
+                >
+                  {sensitiveSubmitting
+                    ? "Sending request..."
+                    : "Request Patient Approval"}
+                </button>
+              </>
+            )}
+
+            {sensitiveMessage && (
+              <div className="sensitive-message">
+                {sensitiveMessage}
+              </div>
+            )}
           </section>
 
           <section className="privacy-card">
@@ -1850,6 +2170,218 @@ button:disabled {
   margin-top: 2px;
 }
 
+.sensitive-access-card {
+  margin-top: 15px;
+  padding: 21px;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  box-shadow: 0 10px 35px rgba(25,48,47,.055);
+}
+
+.sensitive-access-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+}
+
+.sensitive-access-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sensitive-access-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--mint);
+  font-size: 19px;
+}
+
+.sensitive-access-header h2 {
+  margin: 5px 0 0;
+  font-size: 22px;
+  letter-spacing: -.025em;
+}
+
+.sensitive-status-pill {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(230,243,239,.65);
+  color: var(--teal);
+  font-size: 9px;
+  font-weight: 850;
+}
+
+.sensitive-access-description {
+  margin: 14px 0 15px;
+  color: var(--slate);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.sensitive-lock-card,
+.sensitive-active,
+.sensitive-pending {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 15px;
+  border-radius: 15px;
+  border: 1px solid var(--border);
+}
+
+.sensitive-lock-card {
+  background: #fbfdfc;
+}
+
+.sensitive-active {
+  background: var(--mint);
+  border-color: #cfe4dd;
+}
+
+.sensitive-pending {
+  background: #fffaf0;
+  border-color: #eadfc5;
+}
+
+.sensitive-lock-icon,
+.sensitive-active-icon,
+.sensitive-pending-icon {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  background: white;
+}
+
+.sensitive-active-icon {
+  color: var(--teal);
+  font-weight: 900;
+}
+
+.sensitive-lock-card h3,
+.sensitive-active strong,
+.sensitive-pending strong {
+  display: block;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.sensitive-lock-card p,
+.sensitive-active p,
+.sensitive-pending p {
+  margin: 4px 0 0;
+  color: var(--slate);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.sensitive-scope {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 13px;
+}
+
+.sensitive-scope > div {
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--ivory);
+  border: 1px solid var(--border);
+}
+
+.sensitive-scope span {
+  display: block;
+  color: var(--slate);
+  font-size: 9px;
+  font-weight: 750;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+}
+
+.sensitive-scope strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+}
+
+.sensitive-reason-label {
+  display: block;
+  color: var(--charcoal);
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.sensitive-reason-label textarea {
+  display: block;
+  width: 100%;
+  margin-top: 7px;
+  resize: vertical;
+  min-height: 88px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  outline: none;
+  background: #fbfdfc;
+  color: var(--charcoal);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.sensitive-reason-label textarea:focus {
+  border-color: var(--sage);
+  box-shadow: 0 0 0 3px rgba(123,174,157,.14);
+}
+
+.sensitive-request-button {
+  width: 100%;
+  min-height: 46px;
+  margin-top: 11px;
+  border: 0;
+  border-radius: 13px;
+  background: var(--teal);
+  color: white;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.sensitive-request-button:hover:not(:disabled) {
+  background: var(--teal-dark);
+}
+
+.sensitive-request-button:disabled {
+  opacity: .55;
+}
+
+.sensitive-message {
+  margin-top: 11px;
+  padding: 11px 12px;
+  border-radius: 12px;
+  background: rgba(230,243,239,.7);
+  color: var(--teal);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.sensitive-loading {
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--ivory);
+  color: var(--slate);
+  font-size: 10px;
+}
+
 .privacy-card {
   display: flex;
   gap: 11px;
@@ -1994,6 +2526,19 @@ footer {
 
   .insurance-header {
     align-items: flex-start;
+  }
+
+  .sensitive-access-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .sensitive-status-pill {
+    align-self: flex-start;
+  }
+
+  .sensitive-scope {
+    grid-template-columns: 1fr;
   }
 
   .insurance-private-pill {

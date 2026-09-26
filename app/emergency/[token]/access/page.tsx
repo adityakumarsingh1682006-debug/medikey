@@ -38,9 +38,18 @@ export default function HospitalAccessPage() {
 
   const [loading, setLoading] = useState(true);
   const [verifying, setVerifying] = useState(false);
+  const [requestingSensitiveAccess, setRequestingSensitiveAccess] =
+    useState(false);
+
+  const [sensitiveReason, setSensitiveReason] = useState("");
+  const [sensitiveRequestStatus, setSensitiveRequestStatus] = useState<
+    "idle" | "pending" | "error"
+  >("idle");
 
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const [sensitiveRequestMessage, setSensitiveRequestMessage] =
+    useState("");
 
   useEffect(() => {
     async function loadPatient() {
@@ -148,6 +157,85 @@ export default function HospitalAccessPage() {
       );
     } finally {
       setVerifying(false);
+    }
+  }
+
+  async function requestSensitiveAccess() {
+    setError("");
+    setSensitiveRequestMessage("");
+
+    if (!token || !grantId || !verifiedHospital) {
+      setSensitiveRequestMessage(
+        "Verify the hospital before requesting highly sensitive access."
+      );
+      setSensitiveRequestStatus("error");
+      return;
+    }
+
+    const reason = sensitiveReason.trim();
+
+    if (reason.length < 8) {
+      setSensitiveRequestMessage(
+        "Please provide a short clinical reason (at least 8 characters)."
+      );
+      setSensitiveRequestStatus("error");
+      return;
+    }
+
+    setRequestingSensitiveAccess(true);
+    setSensitiveRequestStatus("idle");
+
+    try {
+      const { data, error: requestError } = await supabase.rpc(
+        "create_sensitive_access_request",
+        {
+          p_token: token,
+          p_grant_id: grantId,
+          p_access_scope: ["highly_sensitive"],
+          p_reason: reason,
+        }
+      );
+
+      if (requestError) throw requestError;
+
+      const result = Array.isArray(data) ? data[0] : data;
+
+      if (!result?.request_id) {
+        throw new Error("MediKey did not return a valid access request.");
+      }
+
+      // Keep the existing sensitive-access request/grant system.
+      // The only addition here is an email notification to the patient.
+      const emailResponse = await fetch("/api/hospital-access/send-sensitive-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request_id: result.request_id }),
+      });
+
+      const emailPayload = await emailResponse.json().catch(() => ({}));
+
+      if (!emailResponse.ok) {
+        throw new Error(
+          emailPayload?.error ||
+            "The access request was created, but the patient email could not be sent."
+        );
+      }
+
+      setSensitiveRequestStatus("pending");
+      setSensitiveRequestMessage(
+        `Approval request sent to the patient's registered email. ${result.hospital_name || verifiedHospital.hospital_name} can access highly sensitive information only after patient approval.`
+      );
+      setSensitiveReason("");
+    } catch (err) {
+      console.error("Sensitive access request failed:", err);
+      setSensitiveRequestStatus("error");
+      setSensitiveRequestMessage(
+        err instanceof Error && err.message
+          ? err.message
+          : "Unable to send the sensitive-access request. Please try again."
+      );
+    } finally {
+      setRequestingSensitiveAccess(false);
     }
   }
 
@@ -479,6 +567,82 @@ export default function HospitalAccessPage() {
                 </div>
               )}
 
+              {/* HIGHLY SENSITIVE ACCESS REQUEST */}
+              <section className="sensitive-request-card">
+                <div className="sensitive-request-top">
+                  <div className="sensitive-request-icon">🔐</div>
+                  <div>
+                    <div className="sensitive-request-label">
+                      HIGHLY SENSITIVE INFORMATION
+                    </div>
+                    <h3>Request patient approval</h3>
+                    <p>
+                      Some information is more sensitive than standard
+                      medical records. The patient must approve access
+                      before MediKey releases it.
+                    </p>
+                  </div>
+                </div>
+
+                {sensitiveRequestStatus === "pending" ? (
+                  <div className="sensitive-pending">
+                    <div className="sensitive-pending-icon">✓</div>
+                    <div>
+                      <strong>Approval requested</strong>
+                      <span>{sensitiveRequestMessage}</span>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <label className="sensitive-reason-label">
+                      Reason for access
+                      <textarea
+                        value={sensitiveReason}
+                        onChange={(event) => setSensitiveReason(event.target.value)}
+                        placeholder="e.g. Need to review sensitive medical history relevant to the patient's current treatment."
+                        rows={3}
+                        maxLength={500}
+                      />
+                    </label>
+
+                    {sensitiveRequestMessage && (
+                      <div
+                        className={
+                          sensitiveRequestStatus === "error"
+                            ? "sensitive-request-error"
+                            : "sensitive-request-info"
+                        }
+                      >
+                        {sensitiveRequestMessage}
+                      </div>
+                    )}
+
+                    <button
+                      className="sensitive-request-button"
+                      onClick={requestSensitiveAccess}
+                      disabled={requestingSensitiveAccess}
+                    >
+                      {requestingSensitiveAccess ? (
+                        <>
+                          <span className="button-spinner" />
+                          Sending request...
+                        </>
+                      ) : (
+                        <>
+                          Request Highly Sensitive Access
+                          <span>→</span>
+                        </>
+                      )}
+                    </button>
+
+                    <div className="sensitive-request-footnote">
+                      Your hospital identity, request reason, approval decision,
+                      and later access will be recorded in the MediKey security audit.
+                    </div>
+                  </>
+                )}
+              </section>
+
               {/* REAL NAVIGATION */}
               <button
                 className="records-button"
@@ -493,6 +657,9 @@ export default function HospitalAccessPage() {
                 onClick={() => {
                   setVerifiedHospital(null);
                   setGrantId("");
+                  setSensitiveRequestStatus("idle");
+                  setSensitiveRequestMessage("");
+                  setSensitiveReason("");
                   sessionStorage.removeItem(`medikey-hospital-grant:${token}`);
                   setSuccess("");
                   setError("");
@@ -876,11 +1043,26 @@ input {
   font-size: 13px;
 }
 
-input:focus {
+input:focus,
+textarea:focus {
   border-color: var(--sage);
+  box-shadow: 0 0 0 3px rgba(123,174,157,.13);
+}
 
-  box-shadow:
-    0 0 0 3px rgba(123,174,157,.13);
+textarea {
+  display: block;
+  width: 100%;
+  margin-top: 7px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  outline: none;
+  resize: vertical;
+  min-height: 90px;
+  background: #fbfdfc;
+  color: var(--charcoal);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .verify-button,
@@ -1036,19 +1218,50 @@ input:focus {
 
 .success-message {
   margin-top: 15px;
-
   padding: 12px;
-
   border-radius: 12px;
-
   background: var(--mint);
-
   color: var(--teal-dark);
-
   font-size: 11px;
-
   line-height: 1.45;
 }
+
+.sensitive-request-card {
+  margin-top: 18px;
+  padding: 17px;
+  text-align: left;
+  border: 1px solid #e8ddd1;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #fffdf9 0%, #fffaf3 100%);
+}
+
+.sensitive-request-top { display: flex; align-items: flex-start; gap: 12px; }
+.sensitive-request-icon {
+  width: 42px; height: 42px; flex: 0 0 auto;
+  display: grid; place-items: center; border-radius: 13px;
+  background: #f8efe2; font-size: 19px;
+}
+.sensitive-request-label { color: #9b6b24; font-size: 9px; font-weight: 900; letter-spacing: .12em; }
+.sensitive-request-card h3 { margin: 4px 0 5px; color: var(--charcoal); font-size: 15px; letter-spacing: -.015em; }
+.sensitive-request-card p { margin: 0; color: var(--slate); font-size: 11px; line-height: 1.5; }
+.sensitive-reason-label { margin-top: 15px; }
+.sensitive-request-button {
+  width: 100%; margin-top: 12px; border: 1px solid #d9bd94; border-radius: 12px;
+  padding: 12px 14px; display: flex; align-items: center; justify-content: center; gap: 8px;
+  background: #fff8ed; color: #7d571f; font-size: 12px; font-weight: 850;
+  transition: transform .15s ease, box-shadow .15s ease, opacity .15s ease;
+}
+.sensitive-request-button:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 7px 18px rgba(125,87,31,.12); }
+.sensitive-request-button:disabled { opacity: .65; cursor: wait; }
+.sensitive-request-footnote { margin-top: 10px; color: var(--slate); font-size: 9px; line-height: 1.5; }
+.sensitive-pending { display: flex; align-items: flex-start; gap: 10px; margin-top: 14px; padding: 12px; border-radius: 12px; background: var(--mint); color: var(--teal-dark); }
+.sensitive-pending-icon { width: 28px; height: 28px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 9px; background: white; font-weight: 900; }
+.sensitive-pending strong, .sensitive-pending span { display: block; }
+.sensitive-pending strong { font-size: 11px; }
+.sensitive-pending span { margin-top: 2px; font-size: 10px; line-height: 1.45; }
+.sensitive-request-error, .sensitive-request-info { margin-top: 10px; padding: 10px 11px; border-radius: 10px; font-size: 10px; line-height: 1.45; }
+.sensitive-request-error { background: #fff3f4; border: 1px solid #f1d5d9; color: var(--crimson); }
+.sensitive-request-info { background: var(--mint); color: var(--teal-dark); }
 
 .records-button {
   cursor: pointer;
